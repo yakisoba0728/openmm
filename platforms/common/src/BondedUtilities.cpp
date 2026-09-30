@@ -25,19 +25,55 @@
 #include "openmm/common/BondedUtilities.h"
 #include "openmm/common/ComputeContext.h"
 #include "openmm/OpenMMException.h"
+#include "openmm/CMMotionRemover.h"
+#include "openmm/HarmonicAngleForce.h"
+#include "openmm/HarmonicBondForce.h"
+#include "openmm/MonteCarloBarostat.h"
+#include "openmm/NonbondedForce.h"
+#include "openmm/PeriodicTorsionForce.h"
+#include <cstdlib>
+#include <cstring>
+#include <typeinfo>
 #include <iostream>
 
 using namespace OpenMM;
 using namespace std;
 
-BondedUtilities::BondedUtilities(ComputeContext& context) : context(context), numForceBuffers(0), maxBonds(0), allGroups(0), hasInitializedKernels(false) {
+namespace {
+
+bool allowForceOnlyBondedKernel(ComputeContext& context, const System& system) {
+    const char* enabled = getenv("OPENMM_EXPERIMENT_BONDED_FORCE_ONLY");
+    if ((enabled == NULL || strcmp(enabled, "1") != 0) ||
+            !context.getUseMixedPrecision() || context.getNumContexts() != 1 ||
+            !context.getEnergyParamDerivNames().empty())
+        return false;
+    for (int i = 0; i < system.getNumForces(); i++) {
+        const type_info& type = typeid(system.getForce(i));
+        if (type != typeid(HarmonicBondForce) && type != typeid(HarmonicAngleForce) &&
+                type != typeid(PeriodicTorsionForce) && type != typeid(NonbondedForce) &&
+                type != typeid(MonteCarloBarostat) && type != typeid(CMMotionRemover))
+            return false;
+    }
+    return true;
+}
+
+} // namespace
+
+BondedUtilities::BondedUtilities(ComputeContext& context) : context(context), numForceBuffers(0), maxBonds(0), allGroups(0), hasInitializedKernels(false), usesEvaluationFlags(false) {
 }
 
 void BondedUtilities::addInteraction(const vector<vector<int> >& atoms, const string& source, int group) {
+    addInteractionWithExecutionMode(atoms, source, group, AllEvaluations, false);
+}
+
+void BondedUtilities::addInteractionWithExecutionMode(const vector<vector<int> >& atoms, const string& source,
+        int group, ExecutionMode mode, bool fixedPoint) {
     if (atoms.size() > 0) {
         forceAtoms.push_back(atoms);
         forceSource.push_back(source);
         forceGroup.push_back(group);
+        executionMode.push_back(mode);
+        fixedPointOutput.push_back(fixedPoint);
         allGroups |= 1<<group;
     }
 }
@@ -99,6 +135,29 @@ void BondedUtilities::initialize(const System& system) {
 
     // Create the kernel.
 
+    const bool createForceOnlyKernel = energyParameterDerivatives.empty() && allowForceOnlyBondedKernel(context, system);
+    usesEvaluationFlags = createForceOnlyKernel;
+    for (auto mode : executionMode)
+        if (mode != AllEvaluations)
+            usesEvaluationFlags = true;
+    map<string, string> defines;
+    defines["PADDED_NUM_ATOMS"] = context.intToString(context.getPaddedNumAtoms());
+    ComputeProgram program = context.compileProgram(createKernelSource(false, false, false), defines);
+    kernel = program->createKernel("computeBondedForces");
+    if (createForceOnlyKernel) {
+        const char* staticSetting = getenv("OPENMM_EXPERIMENT_BONDED_STATIC_FORCE_ONLY");
+        const bool staticRequest = staticSetting != NULL && strcmp(staticSetting, "1") == 0;
+        const char* fenceSetting = getenv("OPENMM_EXPERIMENT_BONDED_FORCE_FENCE_ELISION");
+        const bool omitFences = fenceSetting != NULL && strcmp(fenceSetting, "1") == 0 && prefixCode.empty();
+        ComputeProgram forceOnlyProgram = context.compileProgram(createKernelSource(true, staticRequest, omitFences), defines);
+        forceOnlyKernel = forceOnlyProgram->createKernel("computeBondedForces");
+    }
+    forceAtoms.clear();
+    forceSource.clear();
+}
+
+string BondedUtilities::createKernelSource(bool forceOnly, bool staticRequest, bool omitFences) {
+    int numForces = forceAtoms.size();
     stringstream s;
     for (int i = 0; i < (int) prefixCode.size(); i++)
         s<<prefixCode[i];
@@ -114,13 +173,19 @@ void BondedUtilities::initialize(const System& system) {
         s<<", GLOBAL "<<argTypes[i]<<"* customArg"<<(i+1);
     if (energyParameterDerivatives.size() > 0)
         s<<", GLOBAL mixed* RESTRICT energyParamDerivs";
-    s<<") {\n";
+    if (staticRequest)
+        s<<", int unusedIncludeForces, int unusedIncludeEnergy) {\nconst int includeForces = 1;\nconst int includeEnergy = 0;\n";
+    else if (usesEvaluationFlags)
+        s<<", int includeForces, int includeEnergy) {\n";
+    else
+        s<<") {\n";
     s<<"mixed energy = 0;\n";
     for (int i = 0; i < energyParameterDerivatives.size(); i++)
         s<<"mixed energyParamDeriv"<<i<<" = 0;\n";
     for (int force = 0; force < numForces; force++)
-        s<<createForceSource(force, forceAtoms[force].size(), forceAtoms[force][0].size(), forceGroup[force], forceSource[force]);
-    s<<"energyBuffer[GLOBAL_ID] += energy;\n";
+        s<<createForceSource(force, forceAtoms[force].size(), forceAtoms[force][0].size(), forceGroup[force], forceSource[force], omitFences);
+    if (!forceOnly)
+        s<<"energyBuffer[GLOBAL_ID] += energy;\n";
     const vector<string>& allParamDerivNames = context.getEnergyParamDerivNames();
     int numDerivs = allParamDerivNames.size();
     for (int i = 0; i < energyParameterDerivatives.size(); i++)
@@ -128,20 +193,25 @@ void BondedUtilities::initialize(const System& system) {
             if (allParamDerivNames[index] == energyParameterDerivatives[i])
                 s<<"energyParamDerivs[(GLOBAL_ID)*"<<numDerivs<<"+"<<index<<"] += energyParamDeriv"<<i<<";\n";
     s<<"}\n";
-    map<string, string> defines;
-    defines["PADDED_NUM_ATOMS"] = context.intToString(context.getPaddedNumAtoms());
-    ComputeProgram program = context.compileProgram(s.str(), defines);
-    kernel = program->createKernel("computeBondedForces");
-    forceAtoms.clear();
-    forceSource.clear();
+    return s.str();
 }
 
 string BondedUtilities::createForceSource(int forceIndex, int numBonds, int numAtoms, int group, const string& computeForce) {
+    return createForceSource(forceIndex, numBonds, numAtoms, group, computeForce, false);
+}
+
+string BondedUtilities::createForceSource(int forceIndex, int numBonds, int numAtoms, int group, const string& computeForce,
+        bool omitFences) {
     maxBonds = max(maxBonds, numBonds);
     string suffix1[] = {""};
     string suffix4[] = {".x", ".y", ".z", ".w"};
     stringstream s;
-    s<<"if ((groups&"<<(1<<group)<<") != 0)\n";
+    s<<"if ((groups&"<<(1<<group)<<") != 0";
+    if (executionMode[forceIndex] == ForceOnlyEvaluations)
+        s<<" && includeForces && !includeEnergy";
+    else if (executionMode[forceIndex] == OtherEvaluations)
+        s<<" && !(includeForces && !includeEnergy)";
+    s<<")\n";
     s<<"for (unsigned int index = GLOBAL_ID; index < "<<numBonds<<"; index += GLOBAL_SIZE) {\n";
     int startAtom = 0;
     for (int i = 0; i < (int) atomIndices[forceIndex].size(); i++) {
@@ -158,51 +228,82 @@ string BondedUtilities::createForceSource(int forceIndex, int numBonds, int numA
     }
     s<<computeForce<<"\n";
     for (int i = 0; i < numAtoms; i++) {
-        s<<"    ATOMIC_ADD(&forceBuffer[atom"<<(i+1)<<"], (mm_ulong) realToFixedPoint(force"<<(i+1)<<".x));\n";
-        s<<"    ATOMIC_ADD(&forceBuffer[atom"<<(i+1)<<"+PADDED_NUM_ATOMS], (mm_ulong) realToFixedPoint(force"<<(i+1)<<".y));\n";
-        s<<"    ATOMIC_ADD(&forceBuffer[atom"<<(i+1)<<"+PADDED_NUM_ATOMS*2], (mm_ulong) realToFixedPoint(force"<<(i+1)<<".z));\n";
+        if (fixedPointOutput[forceIndex]) {
+            s<<"    ATOMIC_ADD(&forceBuffer[atom"<<(i+1)<<"], fixedForce"<<(i+1)<<"X);\n";
+            s<<"    ATOMIC_ADD(&forceBuffer[atom"<<(i+1)<<"+PADDED_NUM_ATOMS], fixedForce"<<(i+1)<<"Y);\n";
+            s<<"    ATOMIC_ADD(&forceBuffer[atom"<<(i+1)<<"+PADDED_NUM_ATOMS*2], fixedForce"<<(i+1)<<"Z);\n";
+        }
+        else {
+            s<<"    ATOMIC_ADD(&forceBuffer[atom"<<(i+1)<<"], (mm_ulong) realToFixedPoint(force"<<(i+1)<<".x));\n";
+            s<<"    ATOMIC_ADD(&forceBuffer[atom"<<(i+1)<<"+PADDED_NUM_ATOMS], (mm_ulong) realToFixedPoint(force"<<(i+1)<<".y));\n";
+            s<<"    ATOMIC_ADD(&forceBuffer[atom"<<(i+1)<<"+PADDED_NUM_ATOMS*2], (mm_ulong) realToFixedPoint(force"<<(i+1)<<".z));\n";
+        }
+        if (omitFences)
+            s<<"#if !defined(__CUDACC__) || !defined(__CUDA_ARCH__) || defined(__HIPCC__) || !defined(USE_MIXED_PRECISION)\n";
         s<<"    MEM_FENCE;\n";
+        if (omitFences)
+            s<<"#endif\n";
     }
     s<<"}\n";
     return s.str();
 }
 
+void BondedUtilities::initializeKernelArguments(ComputeKernel selectedKernel) {
+    selectedKernel->addArg(context.getLongForceBuffer());
+    selectedKernel->addArg(context.getEnergyBuffer());
+    selectedKernel->addArg(context.getPosq());
+    for (int i = 0; i < 6; i++)
+        selectedKernel->addArg();
+    for (int i = 0; i < (int) atomIndices.size(); i++)
+        for (int j = 0; j < (int) atomIndices[i].size(); j++)
+            selectedKernel->addArg(atomIndices[i][j]);
+    for (int i = 0; i < (int) arguments.size(); i++)
+        selectedKernel->addArg(*arguments[i]);
+    if (energyParameterDerivatives.size() > 0)
+        selectedKernel->addArg(context.getEnergyParamDerivBuffer());
+    evaluationFlagsArg = 9+arguments.size()+(energyParameterDerivatives.empty() ? 0 : 1);
+    for (int i = 0; i < (int) atomIndices.size(); i++)
+        evaluationFlagsArg += atomIndices[i].size();
+    if (usesEvaluationFlags) {
+        selectedKernel->addArg();
+        selectedKernel->addArg();
+    }
+}
+
 void BondedUtilities::computeInteractions(int groups) {
-    if ((groups&allGroups) == 0)
+    computeInteractions(groups, true, true);
+}
+
+void BondedUtilities::computeInteractions(int groups, bool includeForces, bool includeEnergy) {
+    if ((groups&allGroups) == 0 || !hasInteractions)
         return;
     if (!hasInitializedKernels) {
+        initializeKernelArguments(kernel);
+        if (forceOnlyKernel)
+            initializeKernelArguments(forceOnlyKernel);
         hasInitializedKernels = true;
-        kernel->addArg(context.getLongForceBuffer());
-        kernel->addArg(context.getEnergyBuffer());
-        kernel->addArg(context.getPosq());
-        for (int i = 0; i < 6; i++)
-            kernel->addArg();
-        for (int i = 0; i < (int) atomIndices.size(); i++)
-            for (int j = 0; j < (int) atomIndices[i].size(); j++)
-                kernel->addArg(atomIndices[i][j]);
-        for (int i = 0; i < (int) arguments.size(); i++)
-            kernel->addArg(*arguments[i]);
-        if (energyParameterDerivatives.size() > 0)
-            kernel->addArg(context.getEnergyParamDerivBuffer());
     }
-    if (!hasInteractions)
-        return;
-    kernel->setArg(3, groups);
+    ComputeKernel selectedKernel = (includeForces && !includeEnergy && forceOnlyKernel ? forceOnlyKernel : kernel);
+    selectedKernel->setArg(3, groups);
+    if (usesEvaluationFlags) {
+        selectedKernel->setArg(evaluationFlagsArg, (int) includeForces);
+        selectedKernel->setArg(evaluationFlagsArg+1, (int) includeEnergy);
+    }
     Vec3 a, b, c;
     context.getPeriodicBoxVectors(a, b, c);
     if (context.getUseDoublePrecision()) {
-        kernel->setArg(4, mm_double4(a[0], b[1], c[2], 0.0));
-        kernel->setArg(5, mm_double4(1.0/a[0], 1.0/b[1], 1.0/c[2], 0.0));
-        kernel->setArg(6, mm_double4(a[0], a[1], a[2], 0.0));
-        kernel->setArg(7, mm_double4(b[0], b[1], b[2], 0.0));
-        kernel->setArg(8, mm_double4(c[0], c[1], c[2], 0.0));
+        selectedKernel->setArg(4, mm_double4(a[0], b[1], c[2], 0.0));
+        selectedKernel->setArg(5, mm_double4(1.0/a[0], 1.0/b[1], 1.0/c[2], 0.0));
+        selectedKernel->setArg(6, mm_double4(a[0], a[1], a[2], 0.0));
+        selectedKernel->setArg(7, mm_double4(b[0], b[1], b[2], 0.0));
+        selectedKernel->setArg(8, mm_double4(c[0], c[1], c[2], 0.0));
     }
     else {
-        kernel->setArg(4, mm_float4((float) a[0], (float) b[1], (float) c[2], 0.0f));
-        kernel->setArg(5, mm_float4(1.0f/(float) a[0], 1.0f/(float) b[1], 1.0f/(float) c[2], 0.0f));
-        kernel->setArg(6, mm_float4((float) a[0], (float) a[1], (float) a[2], 0.0f));
-        kernel->setArg(7, mm_float4((float) b[0], (float) b[1], (float) b[2], 0.0f));
-        kernel->setArg(8, mm_float4((float) c[0], (float) c[1], (float) c[2], 0.0f));
+        selectedKernel->setArg(4, mm_float4((float) a[0], (float) b[1], (float) c[2], 0.0f));
+        selectedKernel->setArg(5, mm_float4(1.0f/(float) a[0], 1.0f/(float) b[1], 1.0f/(float) c[2], 0.0f));
+        selectedKernel->setArg(6, mm_float4((float) a[0], (float) a[1], (float) a[2], 0.0f));
+        selectedKernel->setArg(7, mm_float4((float) b[0], (float) b[1], (float) b[2], 0.0f));
+        selectedKernel->setArg(8, mm_float4((float) c[0], (float) c[1], (float) c[2], 0.0f));
     }
-    kernel->execute(maxBonds);
+    selectedKernel->execute(maxBonds);
 }

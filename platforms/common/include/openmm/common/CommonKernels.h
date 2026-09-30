@@ -28,6 +28,7 @@
 #include "openmm/common/ComputeArray.h"
 #include "openmm/common/ComputeContext.h"
 #include "openmm/common/ComputeParameterSet.h"
+#include "openmm/common/IntegrationUtilities.h"
 #include "openmm/Platform.h"
 #include "openmm/kernels.h"
 #include "openmm/internal/CompiledExpressionSet.h"
@@ -157,6 +158,9 @@ private:
     ComputeContext& cc;
     ComputeArray floatBuffer, doubleBuffer;
     ComputeKernel copyFloatKernel, copyDoubleKernel;
+    unsigned char* getPositionCorrectionTail(int numParticles);
+    // Scratch capacity reused only after a successful getPositions call.
+    std::vector<Vec3> boxPositionScratch;
 };
 
 /**
@@ -257,6 +261,7 @@ private:
     ForceInfo* info;
     const System& system;
     ComputeArray params;
+    ComputeArray experimentalWaterBondMap, experimentalResidualBondMap;
 };
 
 /**
@@ -972,8 +977,15 @@ private:
     ComputeContext& cc;
     double prevTemp, prevFriction, prevStepSize;
     bool hasInitializedKernels;
+    bool useSettleFusion, traceSettleFusion;
+    bool useResidualTail, traceResidualTail;
+    int settleFusionBlockSize;
+    bool reloadSettleOriginalDelta, traceSettleOccupancy;
     ComputeArray params, oldDelta;
-    ComputeKernel kernel1, kernel2, kernel3;
+    IntegrationUtilities::SettlePartition settlePartition;
+    bool useKickSettleFusion, traceKickSettleFusion;
+    int kickSettleBlockSize;
+    ComputeKernel kernel1, kernel2, kernel3, settleFusionKernel, kickSettleFusionKernel;
 };
 
 /**
@@ -1153,7 +1165,7 @@ private:
     ComputeContext& cc;
     int frequency;
     ComputeArray cmMomentum;
-    ComputeKernel kernel1, kernel2;
+    ComputeKernel kernel1, kernel2, applyCMKernel;
 };
 
 /**

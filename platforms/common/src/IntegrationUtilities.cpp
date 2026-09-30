@@ -612,7 +612,7 @@ IntegrationUtilities::IntegrationUtilities(ComputeContext& context, const System
         defines["HAS_OVERLAPPING_VSITES"] = "1";
     if (numVsiteStages > 1)
         defines["MULTIPLE_VSITE_STAGES"] = "1";
-    ComputeProgram program = context.compileProgram(CommonKernelSources::integrationUtilities, defines);
+    ComputeProgram program = context.compileProgram(CommonKernelSources::settle+CommonKernelSources::integrationUtilities, defines);
     settlePosKernel = program->createKernel("applySettleToPositions");
     settleVelKernel = program->createKernel("applySettleToVelocities");
     shakePosKernel = program->createKernel("applyShakeToPositions");
@@ -820,6 +820,44 @@ double IntegrationUtilities::getLastStepSize() {
 
 void IntegrationUtilities::applyConstraints(double tol) {
     applyConstraintsImpl(false, tol);
+}
+
+void IntegrationUtilities::applyConstraintsWithoutSettle(bool constrainVelocities, double tol) {
+    throw OpenMMException("This platform does not support applying constraints without SETTLE");
+}
+
+bool IntegrationUtilities::createSettlePartition(const System& system, bool includeResidual, SettlePartition& partition) {
+    partition.numSettleAtoms = partition.numResidualAtoms = 0;
+    if (!settleAtoms.isInitialized() || numVsites != 0)
+        return false;
+    vector<mm_int4> clusters;
+    settleAtoms.download(clusters);
+    vector<int> mask(context.getPaddedNumAtoms(), 0);
+    for (auto cluster : clusters) {
+        int atoms[] = {cluster.x, cluster.y, cluster.z};
+        for (int atom : atoms) {
+            if (atom < 0 || atom >= system.getNumParticles() || mask[atom] != 0
+                    || !(system.getParticleMass(atom) > 0) || !std::isfinite(system.getParticleMass(atom)))
+                return false;
+            mask[atom] = 1;
+        }
+    }
+    partition.mask.initialize<int>(context, context.getPaddedNumAtoms(), "langevinMiddleSettleMask");
+    partition.mask.upload(mask);
+    partition.numSettleAtoms = 3*(int) clusters.size();
+    if (includeResidual) {
+        vector<int> residual;
+        for (int atom = 0; atom < context.getNumAtoms(); atom++)
+            if (mask[atom] == 0)
+                residual.push_back(atom);
+        partition.numResidualAtoms = (int) residual.size();
+        // Empty tails still need a valid, unused kernel argument.
+        if (residual.empty())
+            residual.push_back(-1);
+        partition.residualAtoms.initialize<int>(context, residual.size(), "langevinMiddleResidualTail");
+        partition.residualAtoms.upload(residual);
+    }
+    return true;
 }
 
 void IntegrationUtilities::applyVelocityConstraints(double tol) {

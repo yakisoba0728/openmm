@@ -62,8 +62,12 @@ public:
      * Distribute forces from virtual sites to the atoms they are based on.
      */
     void distributeForcesFromVirtualSites();
+    void applyConstraintsWithoutSettle(bool constrainVelocities, double tol) override;
 private:
     void applyConstraintsImpl(bool constrainVelocities, double tol);
+    void applyConstraintsImpl(bool constrainVelocities, double tol, bool includeSettle);
+    int velocitySettleBlockSize;
+    bool traceVelocitySettleBlock, initializedVelocitySettleBlock;
     int* ccmaConvergedMemory;
     CUdeviceptr ccmaConvergedDeviceMemory;
     CUevent ccmaEvent;

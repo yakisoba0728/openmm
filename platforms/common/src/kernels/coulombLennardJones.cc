@@ -1,3 +1,9 @@
+#if APPLY_DIRECT_CUTOFF_GUARD
+{
+if (!isExcluded && r2 < CUTOFF_SQUARED) {
+    real invR = RSQRT(r2);
+    real r = r2*invR;
+#endif
 {
 #if USE_EWALD
     unsigned int includeInteraction = (!isExcluded && r2 < CUTOFF_SQUARED);
@@ -114,3 +120,10 @@
     dEdR += includeInteraction ? tempForce*invR*invR : 0;
 #endif
 }
+#if APPLY_DIRECT_CUTOFF_GUARD
+} else {
+    tempEnergy += (real) 0;
+    dEdR += (real) 0;
+}
+}
+#endif
