@@ -93,6 +93,13 @@ public:
      * @param group    the force group in which the interaction should be calculated
      */
     void addInteraction(const std::vector<std::vector<int> >& atoms, const std::string& source, int group);
+    enum ExecutionMode {AllEvaluations, ForceOnlyEvaluations, OtherEvaluations};
+    /**
+     * Add an interaction for selected evaluations.  Fixed-point interactions supply
+     * fixedForce1X, fixedForce1Y, fixedForce1Z, ... instead of real3 force vectors.
+     */
+    void addInteractionWithExecutionMode(const std::vector<std::vector<int> >& atoms, const std::string& source,
+                                        int group, ExecutionMode mode, bool fixedPointOutput);
     /**
      * Add an argument that should be passed to the interaction kernel.
      * 
@@ -128,21 +135,32 @@ public:
      * @param groups        a set of bit flags for which force groups to include
      */
     void computeInteractions(int groups);
+    /**
+     * Compute interactions for the requested force and energy evaluation.
+     */
+    void computeInteractions(int groups, bool includeForces, bool includeEnergy);
 private:
+    void initializeKernelArguments(ComputeKernel selectedKernel);
+    std::string createKernelSource(bool forceOnly, bool staticRequest, bool omitFences);
     std::string createForceSource(int forceIndex, int numBonds, int numAtoms, int group, const std::string& computeForce);
+    std::string createForceSource(int forceIndex, int numBonds, int numAtoms, int group, const std::string& computeForce,
+                                  bool omitFences);
     ComputeContext& context;
-    ComputeKernel kernel;
+    ComputeKernel kernel, forceOnlyKernel;
     std::vector<std::vector<std::vector<int> > > forceAtoms;
     std::vector<std::vector<int> > indexWidth;
     std::vector<std::string> forceSource;
     std::vector<int> forceGroup;
+    std::vector<ExecutionMode> executionMode;
+    std::vector<bool> fixedPointOutput;
     std::vector<ArrayInterface*> arguments;
     std::vector<std::string> argTypes;
     std::vector<std::vector<ComputeArray> > atomIndices;
     std::vector<std::string> prefixCode;
     std::vector<std::string> energyParameterDerivatives;
     int numForceBuffers, maxBonds, allGroups;
-    bool hasInitializedKernels, hasInteractions;
+    int evaluationFlagsArg;
+    bool hasInitializedKernels, hasInteractions, usesEvaluationFlags;
 };
 
 } // namespace OpenMM

@@ -122,7 +122,8 @@ public:
      * Get the number of energy buffers required for nonbonded forces.
      */
     int getNumEnergyBuffers() {
-        return numForceThreadBlocks*forceThreadBlockSize;
+        // Direct geometry can grow independently of other force consumers.
+        return numDirectForceThreadBlocks*forceThreadBlockSize;
     }
     /**
      * Get whether a cutoff is being used.
@@ -295,7 +296,10 @@ public:
 private:
     class KernelSet;
     class BlockSortTrait;
+    class NeighborReuseReorderListener;
     void initParamArgs();
+    void initializeNeighborReuse(const System& system, int numContexts, int numAtomBlocks);
+    void prepareNeighborReuse(KernelSet& kernels);
     CudaContext& context;
     std::map<int, KernelSet> groupKernels;
     CudaArray exclusionTiles;
@@ -317,6 +321,11 @@ private:
     CudaArray largeBlockBoundingBox;
     CudaArray oldPositions;
     CudaArray rebuildNeighborList;
+    // Options are fixed at initialization; the box snapshot tracks list validity.
+    bool useNeighborReuse, neighborReuseBoxValid, useForcedNeighborRebuild;
+    double neighborSkinFraction;
+    double neighborReuseBox[9];
+    std::vector<void*> initNeighborReuseArgs, checkNeighborReuseArgs;
     ComputeSort blockSorter;
     CUevent downloadCountEvent;
     unsigned int* pinnedCountBuffer;
@@ -333,6 +342,7 @@ private:
     unsigned int maxTiles, maxSinglePairs, tilesAfterReorder;
     long long numTiles;
     std::string kernelSource;
+    int numDirectForceThreadBlocks;
 };
 
 /**
@@ -344,6 +354,7 @@ public:
     bool hasForces;
     std::string source;
     CUfunction forceKernel, energyKernel, forceEnergyKernel;
+    CUfunction initNeighborReuseKernel, checkNeighborReuseKernel;
     CUfunction findBlockBoundsKernel;
     CUfunction computeSortKeysKernel;
     CUfunction sortBoxDataKernel;

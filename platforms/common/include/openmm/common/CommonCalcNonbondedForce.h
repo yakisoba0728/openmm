@@ -45,7 +45,10 @@ namespace OpenMM {
 class CommonCalcNonbondedForceKernel : public CalcNonbondedForceKernel {
 public:
     CommonCalcNonbondedForceKernel(std::string name, const Platform& platform, ComputeContext& cc, const System& system) : CalcNonbondedForceKernel(name, platform),
-            hasInitializedKernel(false), cc(cc), pmeio(NULL), stepsToSort(0) {
+            hasInitializedKernel(false), cc(cc), pmeio(NULL), stepsToSort(0),
+            usePmeCoefficientCache(false), usePmeKnownSortRange(false),
+            usePmeCoarseBuckets(false), usePmeGridAssignmentFusion(false), usePmeDirectPermutation(false),
+            usePmeEnergyOnlySkipForce(false), usePmeRealGridClear(false) {
     }
     ~CommonCalcNonbondedForceKernel();
     /**
@@ -99,6 +102,15 @@ public:
      * @param nz      the number of grid points along the Z axis
      */
     void getLJPMEParameters(double& alpha, int& nx, int& ny, int& nz) const;
+protected:
+    // Optional backend hooks. Other platforms retain their existing behavior.
+    virtual bool supportsPmeExperiments() const { return false; }
+    virtual ComputeSort createPmeSort(ComputeSortImpl::SortTrait* trait, int length, int knownMaximum) {
+        return cc.createSort(trait, length);
+    }
+    virtual bool tryPmePermutation(ComputeSort sorter, ComputeArray& data, ComputeKernel generator,
+            bool coarseBuckets, bool directPhysicalIndices) { return false; }
+    virtual bool deferPmeEnergy(ComputeArray& energy) { return false; }
 private:
     class SortTrait : public ComputeSortImpl::SortTrait {
         int getDataSize() const {return 8;}
@@ -152,6 +164,7 @@ private:
     ComputeKernel computeParamsKernel, computeExclusionParamsKernel, computePlasmaCorrectionKernel;
     ComputeKernel ewaldSumsKernel, ewaldForcesKernel;
     ComputeKernel pmeGridIndexKernel, pmeDispersionGridIndexKernel;
+    ComputeKernel pmeGridIndexAssignmentKernel, pmeGridIndexDirectAssignmentKernel;
     ComputeKernel pmeSpreadChargeKernel, pmeDispersionSpreadChargeKernel;
     ComputeKernel pmeFinishSpreadChargeKernel, pmeDispersionFinishSpreadChargeKernel;
     ComputeKernel pmeConvolutionKernel, pmeDispersionConvolutionKernel;
@@ -168,6 +181,17 @@ private:
     int gridSizeX, gridSizeY, gridSizeZ;
     int dispersionGridSizeX, dispersionGridSizeY, dispersionGridSizeZ;
     int stepsToSort;
+    bool usePmeCoefficientCache, usePmeKnownSortRange;
+    bool usePmeCoarseBuckets, usePmeGridAssignmentFusion, usePmeDirectPermutation;
+    bool usePmeEnergyOnlySkipForce, usePmeRealGridClear;
+    struct PmeCoefficientCache {
+        PmeCoefficientCache() : valid(false) {}
+        ComputeArray coefficients;
+        ComputeKernel buildKernel, applyKernel;
+        unsigned char boxKey[9*sizeof(double)+12*sizeof(float)];
+        bool valid;
+    } pmeCoefficientCache;
+    void updatePmeConvolutionCoefficients(const Vec3* boxVectors, const mm_float4* recipBoxVectors);
     bool usePmeQueue, deviceIsCpu, useFixedPointChargeSpreading, useCpuPme;
     bool hasCoulomb, hasLJ, doLJPME, usePosqCharges, recomputeParams, hasOffsets;
     NonbondedMethod nonbondedMethod;

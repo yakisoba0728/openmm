@@ -31,15 +31,33 @@
 #include "openmm/internal/ContextImpl.h"
 #include "openmm/internal/OSRngSeed.h"
 #include "openmm/Context.h"
+#include "openmm/LangevinMiddleIntegrator.h"
 #include "openmm/kernels.h"
 #include "openmm/OpenMMException.h"
 #include "SimTKOpenMMUtilities.h"
 #include <cmath>
 #include <vector>
 #include <algorithm>
+#include <typeinfo>
+#include <cstdlib>
+#include <cstring>
 
 using namespace OpenMM;
 using namespace std;
+
+namespace {
+
+double computeTrialPotentialEnergy(ContextImpl& context, int groups) {
+    // Only standard Langevin Middle can omit the unused kinetic-energy query
+    // without changing force evaluation or integrator-specific side effects.
+    const char* enabled = std::getenv("OPENMM_EXPERIMENT_BAROSTAT_POTENTIAL_ONLY");
+    if (enabled != NULL && std::strcmp(enabled, "1") == 0 &&
+            typeid(context.getIntegrator()) == typeid(LangevinMiddleIntegrator))
+        return context.calcForcesAndEnergy(false, true, groups);
+    return context.getOwner().getState(State::Energy, false, groups).getPotentialEnergy();
+}
+
+} // namespace
 
 MonteCarloBarostatImpl::MonteCarloBarostatImpl(const MonteCarloBarostat& owner) : owner(owner), step(0) {
 }
@@ -66,7 +84,7 @@ void MonteCarloBarostatImpl::updateContextState(ContextImpl& context, bool& forc
     // Compute the current potential energy.
 
     int groups = context.getIntegrator().getIntegrationForceGroups();
-    double initialEnergy = context.getOwner().getState(State::Energy, false, groups).getPotentialEnergy();
+    double initialEnergy = computeTrialPotentialEnergy(context, groups);
 
     // Modify the periodic box size.
 
@@ -87,7 +105,7 @@ void MonteCarloBarostatImpl::updateContextState(ContextImpl& context, bool& forc
         numberOfScaledParticles = context.getMolecules().size();
     else
         numberOfScaledParticles = context.getSystem().getNumParticles();
-    double finalEnergy = context.getOwner().getState(State::Energy, false, groups).getPotentialEnergy();
+    double finalEnergy = computeTrialPotentialEnergy(context, groups);
     double pressure = context.getParameter(MonteCarloBarostat::Pressure())*(AVOGADRO*1e-25);
     double kT = BOLTZ*context.getParameter(MonteCarloBarostat::Temperature());
     double w = finalEnergy-initialEnergy + pressure*deltaVolume - numberOfScaledParticles*kT*log(newVolume/volume);

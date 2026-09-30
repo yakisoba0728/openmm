@@ -291,6 +291,9 @@ public:
      * Sum the buffer containing energy.
      */
     double reduceEnergy();
+    // The buffer is borrowed until reduceEnergy() or the next force evaluation.
+    bool deferPmeEnergyForReduction(CudaArray& pmeEnergy);
+    void resetDeferredPmeEnergy() { pendingPmeEnergyMerge = NULL; }
     /**
      * Get the maximum number of threads in a thread block supported by this device.
      */
@@ -461,6 +464,9 @@ public:
      * CUDA has been initialized without creating a CudaContext.
      */
     static void ensureCudaInitialized();
+protected:
+    bool prepareReorderDataOnDevice() override;
+    void reorderDataOnDevice(const std::vector<int>& sourcePhysical) override;
 private:
     /**
      * Compute a sorted list of device indices in decreasing order of desirability
@@ -483,6 +489,13 @@ private:
     CUdevice device;
     void* pinnedBuffer;
     CudaArray energyBuffer;
+    bool experimentFusedPmeEnergyReduction;
+    CUfunction reduceEnergyMergedKernel;
+    CudaArray* pendingPmeEnergyMerge;
+    CudaArray* takeDeferredPmeEnergy();
+    bool experimentReorderGather;
+    CUfunction reorderGatherKernel;
+    CudaArray reorderSourcePhysical, reorderVelocityScratch, reorderCorrectionScratch;
     CudaIntegrationUtilities* integration;
     CudaExpressionUtilities* expression;
     CudaBondedUtilities* bonded;

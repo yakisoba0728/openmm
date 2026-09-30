@@ -1,24 +1,87 @@
+DEVICE inline real3 computePmeGridCoordinates(real4 pos, real4 recipBoxVecX, real4 recipBoxVecY, real4 recipBoxVecZ) {
+    real3 t = make_real3(pos.x*recipBoxVecX.x+pos.y*recipBoxVecY.x+pos.z*recipBoxVecZ.x,
+                         pos.y*recipBoxVecY.y+pos.z*recipBoxVecZ.y,
+                         pos.z*recipBoxVecZ.z);
+    t.x = (t.x-floor(t.x))*GRID_SIZE_X;
+    t.y = (t.y-floor(t.y))*GRID_SIZE_Y;
+    t.z = (t.z-floor(t.z))*GRID_SIZE_Z;
+    return t;
+}
+
+DEVICE inline int3 computePmeGridIndex(real3 t) {
+    return make_int3(((int) t.x) % GRID_SIZE_X,
+                               ((int) t.y) % GRID_SIZE_Y,
+                               ((int) t.z) % GRID_SIZE_Z);
+}
+
 KERNEL void findAtomGridIndex(GLOBAL const real4* RESTRICT posq, GLOBAL int2* RESTRICT pmeAtomGridIndex,
         real4 periodicBoxSize, real4 invPeriodicBoxSize, real4 periodicBoxVecX, real4 periodicBoxVecY, real4 periodicBoxVecZ,
         real4 recipBoxVecX, real4 recipBoxVecY, real4 recipBoxVecZ
     ) {
-    // Compute the index of the grid point each atom is associated with.
-
     for (int atom = GLOBAL_ID; atom < NUM_ATOMS; atom += GLOBAL_SIZE) {
         real4 pos = posq[atom];
         APPLY_PERIODIC_TO_POS(pos)
-        real3 t = make_real3(pos.x*recipBoxVecX.x+pos.y*recipBoxVecY.x+pos.z*recipBoxVecZ.x,
-                             pos.y*recipBoxVecY.y+pos.z*recipBoxVecZ.y,
-                             pos.z*recipBoxVecZ.z);
-        t.x = (t.x-floor(t.x))*GRID_SIZE_X;
-        t.y = (t.y-floor(t.y))*GRID_SIZE_Y;
-        t.z = (t.z-floor(t.z))*GRID_SIZE_Z;
-        int3 gridIndex = make_int3(((int) t.x) % GRID_SIZE_X,
-                                   ((int) t.y) % GRID_SIZE_Y,
-                                   ((int) t.z) % GRID_SIZE_Z);
+        real3 t = computePmeGridCoordinates(pos, recipBoxVecX, recipBoxVecY, recipBoxVecZ);
+        int3 gridIndex = computePmeGridIndex(t);
         pmeAtomGridIndex[atom] = make_int2(atom, gridIndex.x*GRID_SIZE_Y*GRID_SIZE_Z+gridIndex.y*GRID_SIZE_Z+gridIndex.z);
     }
 }
+
+#ifdef EXPERIMENT_PME_GRID_ASSIGNMENT_FUSION
+KERNEL void findAtomGridIndexAndAssignBuckets(GLOBAL const real4* RESTRICT posq, GLOBAL int2* RESTRICT pmeAtomGridIndex,
+        real4 periodicBoxSize, real4 invPeriodicBoxSize, real4 periodicBoxVecX, real4 periodicBoxVecY, real4 periodicBoxVecZ,
+        real4 recipBoxVecX, real4 recipBoxVecY, real4 recipBoxVecZ,
+        unsigned int numBuckets, GLOBAL const int* RESTRICT range,
+        GLOBAL unsigned int* RESTRICT bucketOffset, GLOBAL unsigned int* RESTRICT bucketOfElement,
+        GLOBAL unsigned int* RESTRICT offsetInBucket
+    ) {
+    // Match the original uniform bucket assignment's float conversion/division.
+    float minValue = (float) (range[0]);
+    float maxValue = (float) (range[1]);
+    float bucketWidth = (maxValue-minValue)/numBuckets;
+    for (int atom = GLOBAL_ID; atom < NUM_ATOMS; atom += GLOBAL_SIZE) {
+        real4 pos = posq[atom];
+        APPLY_PERIODIC_TO_POS(pos)
+        real3 t = computePmeGridCoordinates(pos, recipBoxVecX, recipBoxVecY, recipBoxVecZ);
+        int3 gridIndex = computePmeGridIndex(t);
+        int gridKey = gridIndex.x*GRID_SIZE_Y*GRID_SIZE_Z+gridIndex.y*GRID_SIZE_Z+gridIndex.z;
+        pmeAtomGridIndex[atom] = make_int2(atom, gridKey);
+        float key = (float) gridKey;
+        unsigned int bucketIndex = min((unsigned int) ((key-minValue)/bucketWidth), numBuckets-1);
+        offsetInBucket[atom] = atomicAdd(&bucketOffset[bucketIndex], 1);
+        bucketOfElement[atom] = bucketIndex;
+    }
+}
+#ifdef EXPERIMENT_PME_DIRECT_PERMUTATION
+KERNEL void findAtomGridIndexAndAssignBucketsDirect(GLOBAL const real4* RESTRICT posq, GLOBAL int2* RESTRICT pmeAtomGridIndex,
+        real4 periodicBoxSize, real4 invPeriodicBoxSize, real4 periodicBoxVecX, real4 periodicBoxVecY, real4 periodicBoxVecZ,
+        real4 recipBoxVecX, real4 recipBoxVecY, real4 recipBoxVecZ,
+        unsigned int numBuckets, GLOBAL const int* RESTRICT range,
+        GLOBAL unsigned int* RESTRICT bucketOffset, GLOBAL unsigned int* RESTRICT bucketOfElement,
+        GLOBAL unsigned int* RESTRICT offsetInBucket
+    ) {
+    // The unused int2 destination preserves the original 10-argument prefix.
+    // Only metadata is written; the final scatter creates int2(physicalIndex, 0).
+
+    // Match the original uniform bucket assignment's float conversion/division.
+    float minValue = (float) (range[0]);
+    float maxValue = (float) (range[1]);
+    float bucketWidth = (maxValue-minValue)/numBuckets;
+    for (int atom = GLOBAL_ID; atom < NUM_ATOMS; atom += GLOBAL_SIZE) {
+        real4 pos = posq[atom];
+        APPLY_PERIODIC_TO_POS(pos)
+        real3 t = computePmeGridCoordinates(pos, recipBoxVecX, recipBoxVecY, recipBoxVecZ);
+        int3 gridIndex = computePmeGridIndex(t);
+        int gridKey = gridIndex.x*GRID_SIZE_Y*GRID_SIZE_Z+gridIndex.y*GRID_SIZE_Z+gridIndex.z;
+        float key = (float) gridKey;
+        unsigned int bucketIndex = min((unsigned int) ((key-minValue)/bucketWidth), numBuckets-1);
+        offsetInBucket[atom] = atomicAdd(&bucketOffset[bucketIndex], 1);
+        bucketOfElement[atom] = bucketIndex;
+    }
+}
+#endif
+
+#endif
 
 KERNEL void gridSpreadCharge(GLOBAL const real4* RESTRICT posq,
 #ifdef USE_FIXED_POINT_CHARGE_SPREADING
@@ -49,15 +112,8 @@ KERNEL void gridSpreadCharge(GLOBAL const real4* RESTRICT posq,
         const real charge = (CHARGE)*EPSILON_FACTOR;
 #endif
         APPLY_PERIODIC_TO_POS(pos)
-        real3 t = make_real3(pos.x*recipBoxVecX.x+pos.y*recipBoxVecY.x+pos.z*recipBoxVecZ.x,
-                             pos.y*recipBoxVecY.y+pos.z*recipBoxVecZ.y,
-                             pos.z*recipBoxVecZ.z);
-        t.x = (t.x-floor(t.x))*GRID_SIZE_X;
-        t.y = (t.y-floor(t.y))*GRID_SIZE_Y;
-        t.z = (t.z-floor(t.z))*GRID_SIZE_Z;
-        int3 gridIndex = make_int3(((int) t.x) % GRID_SIZE_X,
-                                   ((int) t.y) % GRID_SIZE_Y,
-                                   ((int) t.z) % GRID_SIZE_Z);
+        real3 t = computePmeGridCoordinates(pos, recipBoxVecX, recipBoxVecY, recipBoxVecZ);
+        int3 gridIndex = computePmeGridIndex(t);
         if (charge == 0)
             continue;
 
@@ -134,6 +190,26 @@ KERNEL void finishSpreadCharge(
 
 #endif
 
+#ifndef USE_LJPME
+DEVICE inline real computePmeCoulombCoefficient(int kx, int ky, int kz, real recipScaleFactor,
+        GLOBAL const real* RESTRICT pmeBsplineModuliX, GLOBAL const real* RESTRICT pmeBsplineModuliY,
+        GLOBAL const real* RESTRICT pmeBsplineModuliZ, real4 recipBoxVecX, real4 recipBoxVecY, real4 recipBoxVecZ) {
+    int mx = (kx < (GRID_SIZE_X+1)/2) ? kx : (kx-GRID_SIZE_X);
+    int my = (ky < (GRID_SIZE_Y+1)/2) ? ky : (ky-GRID_SIZE_Y);
+    int mz = (kz < (GRID_SIZE_Z+1)/2) ? kz : (kz-GRID_SIZE_Z);
+    real mhx = mx*recipBoxVecX.x;
+    real mhy = mx*recipBoxVecY.x+my*recipBoxVecY.y;
+    real mhz = mx*recipBoxVecZ.x+my*recipBoxVecZ.y+mz*recipBoxVecZ.z;
+    real bx = pmeBsplineModuliX[kx];
+    real by = pmeBsplineModuliY[ky];
+    real bz = pmeBsplineModuliZ[kz];
+    real m2 = mhx*mhx+mhy*mhy+mhz*mhz;
+    real denom = m2*bx*by*bz;
+    real eterm = recipScaleFactor*EXP(-RECIP_EXP_FACTOR*m2)/denom;
+    return eterm;
+}
+#endif
+
 KERNEL void reciprocalConvolution(GLOBAL real2* RESTRICT pmeGrid, GLOBAL const real* RESTRICT pmeBsplineModuliX,
         GLOBAL const real* RESTRICT pmeBsplineModuliY, GLOBAL const real* RESTRICT pmeBsplineModuliZ,
         real4 recipBoxVecX, real4 recipBoxVecY, real4 recipBoxVecZ) {
@@ -155,6 +231,8 @@ KERNEL void reciprocalConvolution(GLOBAL real2* RESTRICT pmeGrid, GLOBAL const r
         int remainder = index-kx*GRID_SIZE_Y*(GRID_SIZE_Z/2+1);
         int ky = remainder/(GRID_SIZE_Z/2+1);
         int kz = remainder-ky*(GRID_SIZE_Z/2+1);
+        real2 grid = pmeGrid[index];
+#ifdef USE_LJPME
         int mx = (kx < (GRID_SIZE_X+1)/2) ? kx : (kx-GRID_SIZE_X);
         int my = (ky < (GRID_SIZE_Y+1)/2) ? ky : (ky-GRID_SIZE_Y);
         int mz = (kz < (GRID_SIZE_Z+1)/2) ? kz : (kz-GRID_SIZE_Z);
@@ -164,9 +242,7 @@ KERNEL void reciprocalConvolution(GLOBAL real2* RESTRICT pmeGrid, GLOBAL const r
         real bx = pmeBsplineModuliX[kx];
         real by = pmeBsplineModuliY[ky];
         real bz = pmeBsplineModuliZ[kz];
-        real2 grid = pmeGrid[index];
         real m2 = mhx*mhx+mhy*mhy+mhz*mhz;
-#ifdef USE_LJPME
         real denom = recipScaleFactor/(bx*by*bz);
         real m = SQRT(m2);
         real m3 = m*m2;
@@ -177,8 +253,8 @@ KERNEL void reciprocalConvolution(GLOBAL real2* RESTRICT pmeGrid, GLOBAL const r
         real eterm = (fac1*erfcterm*m3 + expterm*(fac2 + fac3*m2)) * denom;
         pmeGrid[index] = make_real2(grid.x*eterm, grid.y*eterm);
 #else
-        real denom = m2*bx*by*bz;
-        real eterm = recipScaleFactor*EXP(-RECIP_EXP_FACTOR*m2)/denom;
+        real eterm = computePmeCoulombCoefficient(kx, ky, kz, recipScaleFactor,
+                pmeBsplineModuliX, pmeBsplineModuliY, pmeBsplineModuliZ, recipBoxVecX, recipBoxVecY, recipBoxVecZ);
         if (kx != 0 || ky != 0 || kz != 0) {
             pmeGrid[index] = make_real2(grid.x*eterm, grid.y*eterm);
         } else {
@@ -187,6 +263,41 @@ KERNEL void reciprocalConvolution(GLOBAL real2* RESTRICT pmeGrid, GLOBAL const r
 #endif
     }
 }
+
+#if defined(EXPERIMENT_PME_COEFFICIENT_CACHE) && !defined(USE_LJPME)
+
+KERNEL void buildReciprocalConvolutionCoefficients(GLOBAL real* RESTRICT coefficients,
+        GLOBAL const real* RESTRICT pmeBsplineModuliX, GLOBAL const real* RESTRICT pmeBsplineModuliY,
+        GLOBAL const real* RESTRICT pmeBsplineModuliZ,
+        real4 recipBoxVecX, real4 recipBoxVecY, real4 recipBoxVecZ) {
+    const unsigned int gridSize = GRID_SIZE_X*GRID_SIZE_Y*(GRID_SIZE_Z/2+1);
+    const real recipScaleFactor = RECIP(M_PI)*recipBoxVecX.x*recipBoxVecY.y*recipBoxVecZ.z;
+    for (int index = GLOBAL_ID; index < gridSize; index += GLOBAL_SIZE) {
+        int kx = index/(GRID_SIZE_Y*(GRID_SIZE_Z/2+1));
+        int remainder = index-kx*GRID_SIZE_Y*(GRID_SIZE_Z/2+1);
+        int ky = remainder/(GRID_SIZE_Z/2+1);
+        int kz = remainder-ky*(GRID_SIZE_Z/2+1);
+        real eterm = computePmeCoulombCoefficient(kx, ky, kz, recipScaleFactor,
+                pmeBsplineModuliX, pmeBsplineModuliY, pmeBsplineModuliZ, recipBoxVecX, recipBoxVecY, recipBoxVecZ);
+        coefficients[index] = (index == 0 ? 0 : eterm);
+    }
+}
+
+KERNEL void applyReciprocalConvolutionCoefficients(GLOBAL real2* RESTRICT pmeGrid,
+        GLOBAL const real* RESTRICT coefficients) {
+    const unsigned int gridSize = GRID_SIZE_X*GRID_SIZE_Y*(GRID_SIZE_Z/2+1);
+    for (int index = GLOBAL_ID; index < gridSize; index += GLOBAL_SIZE) {
+        if (index != 0) {
+            real2 grid = pmeGrid[index];
+            real eterm = coefficients[index];
+            pmeGrid[index] = make_real2(grid.x*eterm, grid.y*eterm);
+        }
+        else
+            pmeGrid[index] = make_real2(0);
+    }
+}
+
+#endif
 
 KERNEL void gridEvaluateEnergy(GLOBAL real2* RESTRICT pmeGrid, GLOBAL mixed* RESTRICT energyBuffer,
                       GLOBAL const real* RESTRICT pmeBsplineModuliX, GLOBAL const real* RESTRICT pmeBsplineModuliY, GLOBAL const real* RESTRICT pmeBsplineModuliZ,
@@ -273,15 +384,8 @@ KERNEL void gridInterpolateForce(GLOBAL const real4* RESTRICT posq, GLOBAL mm_ul
         real3 force = make_real3(0);
         real4 pos = posq[atom];
         APPLY_PERIODIC_TO_POS(pos)
-        real3 t = make_real3(pos.x*recipBoxVecX.x+pos.y*recipBoxVecY.x+pos.z*recipBoxVecZ.x,
-                             pos.y*recipBoxVecY.y+pos.z*recipBoxVecZ.y,
-                             pos.z*recipBoxVecZ.z);
-        t.x = (t.x-floor(t.x))*GRID_SIZE_X;
-        t.y = (t.y-floor(t.y))*GRID_SIZE_Y;
-        t.z = (t.z-floor(t.z))*GRID_SIZE_Z;
-        int3 gridIndex = make_int3(((int) t.x) % GRID_SIZE_X,
-                                   ((int) t.y) % GRID_SIZE_Y,
-                                   ((int) t.z) % GRID_SIZE_Z);
+        real3 t = computePmeGridCoordinates(pos, recipBoxVecX, recipBoxVecY, recipBoxVecZ);
+        int3 gridIndex = computePmeGridIndex(t);
 #ifdef CHARGE_FROM_SIGEPS
         const float2 sigEps = sigmaEpsilon[atom];
         real q = 8*sigEps.x*sigEps.x*sigEps.x*sigEps.y;
@@ -367,15 +471,8 @@ KERNEL void gridInterpolateChargeDerivatives(GLOBAL const real4* RESTRICT posq, 
         real derivative = 0;
         real4 pos = posq[atom];
         APPLY_PERIODIC_TO_POS(pos)
-        real3 t = make_real3(pos.x*recipBoxVecX.x+pos.y*recipBoxVecY.x+pos.z*recipBoxVecZ.x,
-                             pos.y*recipBoxVecY.y+pos.z*recipBoxVecZ.y,
-                             pos.z*recipBoxVecZ.z);
-        t.x = (t.x-floor(t.x))*GRID_SIZE_X;
-        t.y = (t.y-floor(t.y))*GRID_SIZE_Y;
-        t.z = (t.z-floor(t.z))*GRID_SIZE_Z;
-        int3 gridIndex = make_int3(((int) t.x) % GRID_SIZE_X,
-                                   ((int) t.y) % GRID_SIZE_Y,
-                                   ((int) t.z) % GRID_SIZE_Z);
+        real3 t = computePmeGridCoordinates(pos, recipBoxVecX, recipBoxVecY, recipBoxVecZ);
+        int3 gridIndex = computePmeGridIndex(t);
 
         // Since we need the full set of thetas, it's faster to compute them here than load them
         // from global memory.

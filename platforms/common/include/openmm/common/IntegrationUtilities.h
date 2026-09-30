@@ -81,6 +81,28 @@ public:
      * @param tol             the constraint tolerance
      */
     void applyConstraints(double tol);
+    /** Apply the residual constraints after an integrator has applied SETTLE. */
+    virtual void applyConstraintsWithoutSettle(bool constrainVelocities, double tol);
+    /** The disjoint SETTLE mask and its optional complement of real atoms. */
+    struct SettlePartition {
+        SettlePartition() : numSettleAtoms(0), numResidualAtoms(0) {}
+        ComputeArray mask, residualAtoms;
+        int numSettleAtoms, numResidualAtoms;
+    };
+    /** Build a partition only when all SETTLE atoms have finite positive masses. */
+    bool createSettlePartition(const System& system, bool includeResidual, SettlePartition& partition);
+    int getNumSettleClusters() const {
+        return settleAtoms.isInitialized() ? settleAtoms.getSize() : 0;
+    }
+    int getNumVirtualSites() const {
+        return numVsites;
+    }
+    ComputeArray& getSettleAtomsForLangevinMiddle() {
+        return settleAtoms;
+    }
+    ComputeArray& getSettleParamsForLangevinMiddle() {
+        return settleParams;
+    }
     /**
      * Apply constraints to the atom velocities.
      *
